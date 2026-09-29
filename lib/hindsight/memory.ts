@@ -1,29 +1,21 @@
-import { getHindsightClient, hindsightBankId } from "@/lib/hindsight/client";
-import type {
-  Incident,
-  Resolution,
-  RetrievedMemory,
-} from "@/types";
-
-type RecallResult = {
-  id?: string;
-  text: string;
-};
+import type { RecallResult } from "@vectorize-io/hindsight-client";
+import { getHindsightClient, hindsightBankId } from "./client";
+import type { Incident, Resolution, RetrievedMemory } from "@/types";
 
 function extractField(text: string, field: string) {
-  const regex = new RegExp(
-    `${field}:\\s*(.+?)(?:\\n|$)`,
+  const pattern = new RegExp(
+    `${field.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*:\\s*(.+)`,
     "i"
   );
 
-  return text.match(regex)?.[1]?.trim();
+  return text.match(pattern)?.[1]?.trim();
 }
 
 function extractIncidentId(text: string) {
-  return text.match(/Incident ID:\s*(INC-\d+)/i)?.[1];
+  return text.match(/\bINC-\d+\b/i)?.[0]?.toUpperCase();
 }
 
-function formatIncidentMemory(
+export function formatIncidentMemory(
   incident: Incident,
   resolution: Resolution,
   relevantIncident?: string
@@ -34,17 +26,15 @@ function formatIncidentMemory(
     `Service: ${incident.service}`,
     `Severity: ${incident.severity}`,
     `Error code: ${incident.errorCode}`,
-    `Date: ${incident.timestamp || new Date().toISOString()}`,
+    `Date: ${incident.timestamp || incident.createdAt}`,
     `Description: ${incident.description}`,
     `Symptoms: ${incident.symptoms.join("; ")}`,
     `Recent changes: ${incident.recentChanges}`,
     `Affected users: ${incident.affectedUsers}`,
     `Root cause: ${resolution.rootCause}`,
-    `Resolution: ${resolution.resolution}`,
-    `Outcome: ${resolution.outcome}`,
-    relevantIncident
-      ? `Related incident: ${relevantIncident}`
-      : "",
+    `Resolution: ${String((resolution as unknown as Record<string, unknown>).resolution ?? "")}`,
+`Outcome: ${String((resolution as unknown as Record<string, unknown>).outcome ?? "")}`,
+    relevantIncident ? `Related incident: ${relevantIncident}` : "",
   ]
     .filter(Boolean)
     .join("\n");
@@ -61,15 +51,9 @@ export async function retainIncident(
 
   return getHindsightClient().retain(
     hindsightBankId(),
-    formatIncidentMemory(
-      incident,
-      resolution,
-      relevantIncident
-    ),
+    formatIncidentMemory(incident, resolution, relevantIncident),
     {
-      timestamp:
-        incident.timestamp ||
-        new Date().toISOString(),
+      timestamp: incident.timestamp || new Date().toISOString(),
       context:
         "Resolved production incident and operator-authored post-incident learning.",
       documentId: incident.id.toLowerCase(),
@@ -93,9 +77,7 @@ export async function recallRelevantIncidents(
   query: string,
   limit = 8
 ): Promise<RetrievedMemory[]> {
-  const hindsight = getHindsightClient();
-
-  const response = await hindsight.recall(
+  const response = await getHindsightClient().recall(
     hindsightBankId(),
     query,
     {
@@ -107,56 +89,29 @@ export async function recallRelevantIncidents(
 
   return response.results
     .slice(0, limit)
-    .map(
-      (
-        result: RecallResult,
-        index: number
-      ) => ({
-        id:
-          extractIncidentId(result.text) ||
-          result.id ||
-          `memory-${index + 1}`,
-        text: result.text,
-        source: "hindsight" as const,
-        title: extractField(
-          result.text,
-          "Incident title"
-        ),
-        service: extractField(
-          result.text,
-          "Service"
-        ),
-        date: extractField(
-          result.text,
-          "Date"
-        ),
-        rootCause: extractField(
-          result.text,
-          "Root cause"
-        ),
-        resolution: extractField(
-          result.text,
-          "Resolution"
-        ),
-        outcome: extractField(
-          result.text,
-          "Outcome"
-        ),
-      })
-    );
+    .map((result: RecallResult, index: number) => ({
+      id:
+        extractIncidentId(result.text) ||
+        result.id ||
+        `memory-${index + 1}`,
+      text: result.text,
+      source: "hindsight" as const,
+      title: extractField(result.text, "Incident title"),
+      service: extractField(result.text, "Service"),
+      date: extractField(result.text, "Date"),
+      rootCause: extractField(result.text, "Root cause"),
+      resolution: extractField(result.text, "Resolution"),
+      outcome: extractField(result.text, "Outcome"),
+    }));
 }
 
 export async function reflectOnIncidents(
   query: string,
   memories: RetrievedMemory[]
 ) {
-  if (memories.length === 0) {
-    return null;
-  }
+  if (memories.length === 0) return null;
 
-  const incidentIds = memories.map(
-    (memory) => memory.id
-  );
+  const incidentIds = memories.map((memory) => memory.id);
 
   const response = await getHindsightClient().reflect(
     hindsightBankId(),
@@ -165,9 +120,7 @@ export async function reflectOnIncidents(
       budget: "low",
       context: `Use the following recall results as the only evidence. Do not introduce incident IDs or operational facts not present here.
 
-${memories
-  .map((memory) => memory.text)
-  .join("\n\n---\n\n")}`,
+${memories.map((memory) => memory.text).join("\n\n---\n\n")}`,
       responseSchema: {
         type: "object",
         properties: {
@@ -184,36 +137,17 @@ ${memories
             },
           },
         },
-        required: [
-          "summary",
-          "supporting_incidents",
-        ],
+        required: ["summary", "supporting_incidents"],
         additionalProperties: false,
       },
     }
   );
 
-  return {
-    summary:
-      response.structured_output?.summary ||
-      response.text ||
-      "",
-    supportingIncidents:
-      Array.isArray(
-        response.structured_output
-          ?.supporting_incidents
-      )
-        ? response.structured_output
-            .supporting_incidents
-        : [],
-  };
+  return response;
 }
 
-export async function seedDemoMemories(
-  memories: RetrievedMemory[]
-) {
+export async function seedDemoMemories(memories: RetrievedMemory[]) {
   const hindsight = getHindsightClient();
-
   const missing: RetrievedMemory[] = [];
 
   for (const memory of memories) {
@@ -229,9 +163,7 @@ export async function seedDemoMemories(
 
     if (
       existing.results.some((result) =>
-        result.text.includes(
-          `Incident ID: ${memory.id}`
-        )
+        result.text.includes(`Incident ID: ${memory.id}`)
       )
     ) {
       continue;
@@ -239,39 +171,33 @@ export async function seedDemoMemories(
 
     missing.push(memory);
 
-    await hindsight.retain(
-      hindsightBankId(),
-      memory.text,
-      {
-        timestamp: memory.date,
-        context:
-          "Synthetic IncidentIQ demo incident; not customer or company data.",
-        documentId: memory.id.toLowerCase(),
-        metadata: {
-          incident_id: memory.id,
-          service:
-            memory.service || "unknown",
-          status: "resolved",
-        },
-        tags: [
-          "incident",
-          "incidentiq",
-          "incidentiq-demo",
-          `service:${(
-            memory.service || "unknown"
-          )
-            .toLowerCase()
-            .replace(/[^a-z0-9-]/g, "-")}`,
-        ],
-        updateMode: "replace",
-      }
-    );
+    await hindsight.retain(hindsightBankId(), memory.text, {
+      timestamp: memory.date,
+      context:
+        "Synthetic IncidentIQ demo incident; not customer or company data.",
+      documentId: memory.id.toLowerCase(),
+      metadata: {
+        incident_id: memory.id,
+        service: memory.service || "unknown",
+        status: "resolved",
+      },
+      tags: [
+        "incident",
+        "incidentiq",
+        "incidentiq-demo",
+        `service:${(memory.service || "unknown")
+          .toLowerCase()
+          .replace(/[^a-z0-9-]/g, "-")}`,
+      ],
+      updateMode: "replace",
+    });
   }
 
   return {
     added: missing.length,
-    existing:
-      memories.length - missing.length,
+    existing: memories.length - missing.length,
     total: memories.length,
   };
 }
+
+export { extractField };
